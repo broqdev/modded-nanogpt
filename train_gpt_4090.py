@@ -645,6 +645,19 @@ for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
 
+# Load checkpoint if specified
+start_step = 0
+if args.load_checkpoint_path:
+    print0(f"Loading checkpoint from {args.load_checkpoint_path}")
+    checkpoint = torch.load(args.load_checkpoint_path, map_location='cuda')
+    model.load_state_dict(checkpoint['model'])
+    for opt, opt_state in zip(optimizers, checkpoint['optimizers']):
+        opt.load_state_dict(opt_state)
+    start_step = checkpoint['step']
+    training_time_ms = checkpoint.get('training_time_ms', 0)
+    print0(f"Checkpoint loaded: step {start_step}, training_time_ms {training_time_ms}")
+    del checkpoint
+
 # learning rate schedule: stable then decay
 def get_lr(step: int):
     x = step / args.num_iterations # progress in training
@@ -701,7 +714,7 @@ torch.cuda.synchronize()
 t0 = time.perf_counter()
 # begin training
 train_steps = args.num_iterations
-for step in range(train_steps + 1):
+for step in range(start_step, train_steps + 1):
     last_step = (step == train_steps)
 
     # --------------- VALIDATION SECTION -----------------
@@ -731,9 +744,17 @@ for step in range(train_steps + 1):
 
     if last_step:
         if master_process and args.save_checkpoint:
-            log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+            checkpoint = dict(
+                step=step+1, 
+                training_time_ms=training_time_ms,
+                code=code, 
+                model=model.state_dict(), 
+                optimizers=[opt.state_dict() for opt in optimizers]
+            )
             os.makedirs(f"logs/{run_id}", exist_ok=True)
-            torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
+            p = f"logs/{run_id}/state_step{step:06d}.pt")
+            torch.save(checkpoint, p)
+            print0(f"Checkpoint saved: {p}")
         # the last step only has the validation loop, so break to avoid training
         break
 
