@@ -351,15 +351,7 @@ class CausalSelfAttention(nn.Module):
         else: # skip mid-layers token value embeddings by @YouJiacheng
             v = lambdas[0] * v
         #### https://github.com/pytorch/pytorch/issues/133254
-        kernel_options={
-            "BLOCK_M":  32,
-            "BLOCK_N":  32,
-            "BLOCK_M1": 32,
-            "BLOCK_N1": 32,
-            "BLOCK_M2": 32,
-            "BLOCK_N2": 32,                
-        }
-        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale, kernel_options=kernel_options).transpose(1, 2)
+        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=self.attn_scale).transpose(1, 2)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = self.c_proj(y)
         return y
@@ -534,7 +526,7 @@ def find_batch_starts(tokens: Tensor, pos: int, local_batch_size: int, max_batch
             start = end
     assert False # increase max_batch_span if necessary
 
-def distributed_data_generator(filename_pattern: str, batch_size: int, max_batch_span_scale_down: int, align_to_bos: bool):
+def distributed_data_generator(filename_pattern: str, batch_size: int, max_batch_span_scale_up: int, align_to_bos: bool):
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     files = [Path(file) for file in sorted(glob.glob(filename_pattern))]
@@ -542,7 +534,7 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, max_batch
     local_batch_size = batch_size // world_size
     file_iter = iter(files) # use itertools.cycle(files) instead if you want to do multi-epoch training
     tokens, pos = _load_data_shard(next(file_iter)), 0
-    max_batch_span = 2 * max_batch_span_scale_down * batch_size if align_to_bos else max_batch_span_scale_down * batch_size # provide buffer to handle samples up to length local_batch_size
+    max_batch_span = 2 * max_batch_span_scale_up * batch_size if align_to_bos else max_batch_span_scale_down * batch_size # provide buffer to handle samples up to length local_batch_size
     while True:
         if pos + max_batch_span + 1 >= len(tokens):
             tokens, pos = _load_data_shard(next(file_iter)), 0
@@ -569,20 +561,18 @@ class Hyperparameters:
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     #### train_seq_len = 48*1024 # FlexAttention sequence length
     world_size_scale_down = 8
-    train_seq_len_scale_down = 1
-    train_seq_len = 32*1024 // train_seq_len_scale_down # FlexAttention sequence length
+    train_seq_len = 48*1024 # FlexAttention sequence length
     #### val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
     # val_seq_len_scale_down = 8
-    val_seq_len_scale_down = 1
-    val_seq_len = 32*1024 // val_seq_len_scale_down # FlexAttention sequence length for validation
+    val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
     # optimization
-    lr_scale_down = 24
+    lr_scale_down = 8
     #### lr_scale_down = 24
     #### num_iterations = 1750 # number of iterations to run
-    num_iterations = 23000 # number of iterations to run
+    num_iterations = 1750 * 8 # number of iterations to run
     # num_iterations = 23000 # number of iterations to run
     #### cooldown_frac = 0.45 # fraction of training spent cooling down the learning rate
-    cooldown_frac = 0.6
+    cooldown_frac = 0.45
     # evaluation and logging
     val_loss_every = 1000 # every how many steps to evaluate val loss? 0 for only at the end
     # load_checkpoint_path = "logs/cfce468e-703e-4369-9a77-8d040bf47fa0/state_step010000.pt"
@@ -696,8 +686,7 @@ if args.load_checkpoint_path:
 warmup_steps = 10
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
-train_max_batch_span_scale_down = args.world_size_scale_down * args.train_seq_len_scale_down
-train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, max_batch_span_scale_down=train_max_batch_span_scale_down, align_to_bos=True)
+train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, max_batch_span_scale_up=args.world_size_scale_down, align_to_bos=True)
 for _ in range(warmup_steps):
     inputs, targets = next(train_loader)
     model(inputs, targets, get_window_size_blocks(1)).backward()
@@ -713,8 +702,7 @@ del train_loader, initial_state
 #        Training and validation       #
 ########################################
 
-train_max_batch_span_scale_down = args.world_size_scale_down * args.train_seq_len_scale_down
-train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, max_batch_span_scale_down=train_max_batch_span_scale_down, align_to_bos=True)
+train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, max_batch_span_scale_up=args.world_size_scale_down, align_to_bos=True)
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
@@ -732,10 +720,9 @@ for step in range(start_step, train_steps + 1):
         training_time_ms += 1000 * (time.perf_counter() - t0)
         model.eval()
         val_batch_size = world_size * args.val_seq_len
-        val_max_batch_span_scale_down = args.world_size_scale_down * args.val_seq_len_scale_down
         assert args.val_tokens % val_batch_size == 0
         val_steps = args.val_tokens // val_batch_size
-        val_loader = distributed_data_generator(args.val_files, val_batch_size, max_batch_span_scale_down=val_max_batch_span_scale_down, align_to_bos=False)
+        val_loader = distributed_data_generator(args.val_files, val_batch_size, max_batch_span_scale_up=args.world_size_scale_down, align_to_bos=False)
         val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):

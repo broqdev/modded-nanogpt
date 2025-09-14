@@ -8,7 +8,7 @@ app = modal.App("nano-gpt-1")
 path_repo = "/root/modded-nanogpt"
 
 commands = f'''
-git clone https://github.com/KellerJordan/modded-nanogpt.git {path_repo}
+git clone -b poc_4090_dev https://github.com/broqdev/modded-nanogpt.git {path_repo}
 cd {path_repo} && pip install -r requirements.txt
 # pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126 --upgrade
 # downloads only the first 800M training tokens to save time
@@ -27,12 +27,12 @@ image = (
 # Define the main function
 @app.function(
     image=image,
-    gpu="H100:8",
+    gpu="H100:1",
     timeout=20 * 60,  # set 20 minutes timeout since modal may take long time to request gpus
 )
 @modal.experimental.clustered(size=1)
 def train_nanogpt():
-    assert Path(f"{path_repo}/train_gpt.py").exists()
+    assert Path(f"{path_repo}/train_gpt_4090.py").exists()
 
     # change working directory to repo
     os.chdir(path_repo)
@@ -46,8 +46,8 @@ def train_nanogpt():
         parse_args(
             [
                 f"--standalone",
-                f"--nproc-per-node=8",
-                "train_gpt.py",
+                f"--nproc-per-node=1",
+                "train_gpt_4090.py",
             ]
         )
     )
