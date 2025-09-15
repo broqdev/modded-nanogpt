@@ -1,3 +1,7 @@
+[2025-09-14] Add train_gpt_4090.py
+* step:23000/23000 val_loss:3.4125 train_time:9506004ms step_avg:413.30ms
+* lr is not tuned so the speed is not optimized
+* cannot get <3.4 validation loss by just training one epoch due to reduced train_seq_len/val_seq_len
 [2025-09-03] Add modal_train.py for training with Modal
 ---
 

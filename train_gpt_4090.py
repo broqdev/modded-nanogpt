@@ -352,8 +352,8 @@ class CausalSelfAttention(nn.Module):
             v = lambdas[0] * v
         #### https://github.com/pytorch/pytorch/issues/133254
         kernel_options={
-            "BLOCK_M": 32,
-            "BLOCK_N": 32,
+            "BLOCK_M":  32,
+            "BLOCK_N":  32,
             "BLOCK_M1": 32,
             "BLOCK_N1": 32,
             "BLOCK_M2": 32,
@@ -534,7 +534,7 @@ def find_batch_starts(tokens: Tensor, pos: int, local_batch_size: int, max_batch
             start = end
     assert False # increase max_batch_span if necessary
 
-def distributed_data_generator(filename_pattern: str, batch_size: int, max_batch_span_scale_down: int, align_to_bos: bool):
+def distributed_data_generator(filename_pattern: str, batch_size: int, max_batch_span_scale_up: int, align_to_bos: bool):
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     files = [Path(file) for file in sorted(glob.glob(filename_pattern))]
@@ -542,7 +542,7 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, max_batch
     local_batch_size = batch_size // world_size
     file_iter = iter(files) # use itertools.cycle(files) instead if you want to do multi-epoch training
     tokens, pos = _load_data_shard(next(file_iter)), 0
-    max_batch_span = 2 * max_batch_span_scale_down * batch_size if align_to_bos else max_batch_span_scale_down * batch_size # provide buffer to handle samples up to length local_batch_size
+    max_batch_span = 2 * max_batch_span_scale_up * batch_size if align_to_bos else max_batch_span_scale_up * batch_size # provide buffer to handle samples up to length local_batch_size
     while True:
         if pos + max_batch_span + 1 >= len(tokens):
             tokens, pos = _load_data_shard(next(file_iter)), 0
@@ -569,20 +569,19 @@ class Hyperparameters:
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     #### train_seq_len = 48*1024 # FlexAttention sequence length
     world_size_scale_down = 8
-    train_seq_len_scale_down = 2
-    train_seq_len = 48*1024 // train_seq_len_scale_down # FlexAttention sequence length
+    train_seq_len = 32*1024 # FlexAttention sequence length
     #### val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
-    val_seq_len_scale_down = 8
-    val_seq_len = 4*64*1024 // val_seq_len_scale_down # FlexAttention sequence length for validation
+    val_seq_len = 32*1024 # FlexAttention sequence length for validation
     # optimization
-    lr_scale_down = 10
+    lr_scale_down = 24
     #### num_iterations = 1750 # number of iterations to run
-    num_iterations = 1750 * 2 # number of iterations to run
-    cooldown_frac = 0.45 # fraction of training spent cooling down the learning rate
+    num_iterations = 23000 # number of iterations to run
+    cooldown_frac = 0.6
     # evaluation and logging
-    val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every = 1000 # every how many steps to evaluate val loss? 0 for only at the end
+    # load_checkpoint_path = "logs/cfce468e-703e-4369-9a77-8d040bf47fa0/state_step010000.pt"
     load_checkpoint_path = None
-    save_checkpoint = False
+    checkpoint_every = 1000
 args = Hyperparameters()
 
 # torchrun sets these env variables
@@ -646,14 +645,14 @@ for opt in optimizers:
         group["initial_lr"] = group["lr"]
 
 # learning rate schedule: stable then decay
-def get_lr(step: int):
+def get_lr(step: int, ratio_low: float = 0.1):
     x = step / args.num_iterations # progress in training
     assert 0 <= x < 1
     if x < 1 - args.cooldown_frac:
         return 1.0
     else:
         w = (1 - x) / args.cooldown_frac
-        return w * 1.0 + (1 - w) * 0.1
+        return w * 1.0 + (1 - w) * ratio_low
 
 # attention window size schedule: linearly increase
 @lru_cache(1)
@@ -669,6 +668,20 @@ def get_window_size_blocks(step: int):
 
 model: nn.Module = torch.compile(model, dynamic=False)
 
+# Load checkpoint if specified
+start_step = 0
+if args.load_checkpoint_path:
+    print0(f"Loading checkpoint from {args.load_checkpoint_path}")
+    checkpoint = torch.load(args.load_checkpoint_path, map_location='cuda')
+    model.zero_grad(set_to_none=True)
+    model.load_state_dict(checkpoint['model'])
+    for opt, opt_state in zip(optimizers, checkpoint['optimizers']):
+        opt.load_state_dict(opt_state)
+    start_step = checkpoint['step']
+    training_time_ms = checkpoint.get('training_time_ms', 0)
+    print0(f"Checkpoint loaded: step {start_step}, training_time_ms {training_time_ms}", console=True)
+    del checkpoint
+
 ########################################
 #            Warmup kernels            #
 ########################################
@@ -677,8 +690,7 @@ model: nn.Module = torch.compile(model, dynamic=False)
 warmup_steps = 10
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
-train_max_batch_span_scale_down = args.world_size_scale_down * args.train_seq_len_scale_down
-train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, max_batch_span_scale_down=train_max_batch_span_scale_down, align_to_bos=True)
+train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, max_batch_span_scale_up=args.world_size_scale_down, align_to_bos=True)
 for _ in range(warmup_steps):
     inputs, targets = next(train_loader)
     model(inputs, targets, get_window_size_blocks(1)).backward()
@@ -694,27 +706,27 @@ del train_loader, initial_state
 #        Training and validation       #
 ########################################
 
-train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, max_batch_span_scale_down=train_max_batch_span_scale_down, align_to_bos=True)
+train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, max_batch_span_scale_up=args.world_size_scale_down, align_to_bos=True)
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
 t0 = time.perf_counter()
 # begin training
 train_steps = args.num_iterations
-for step in range(train_steps + 1):
+for step in range(start_step, train_steps + 1):
+    first_step = (step == start_step)
     last_step = (step == train_steps)
 
     # --------------- VALIDATION SECTION -----------------
-    if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+    if last_step or (not first_step and args.val_loss_every > 0 and step % args.val_loss_every == 0):
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
         model.eval()
         val_batch_size = world_size * args.val_seq_len
-        val_max_batch_span_scale_down = args.world_size_scale_down * args.val_seq_len_scale_down
         assert args.val_tokens % val_batch_size == 0
         val_steps = args.val_tokens // val_batch_size
-        val_loader = distributed_data_generator(args.val_files, val_batch_size, max_batch_span_scale_down=val_max_batch_span_scale_down, align_to_bos=False)
+        val_loader = distributed_data_generator(args.val_files, val_batch_size, max_batch_span_scale_up=args.world_size_scale_down, align_to_bos=False)
         val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):
@@ -728,12 +740,22 @@ for step in range(train_steps + 1):
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.perf_counter()
+    
+    if last_step or (not first_step and args.checkpoint_every > 0 and step % args.checkpoint_every == 0):
+        if master_process:
+            checkpoint = dict(
+                step=step, 
+                training_time_ms=training_time_ms,
+                code=code, 
+                model=model.state_dict(), 
+                optimizers=[opt.state_dict() for opt in optimizers]
+            )
+            os.makedirs(f"logs/{run_id}", exist_ok=True)
+            p = f"logs/{run_id}/state_step{step:06d}.pt"
+            torch.save(checkpoint, p)
+            print0(f"Checkpoint saved: step {step} path {p}", console=True)
 
     if last_step:
-        if master_process and args.save_checkpoint:
-            log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-            os.makedirs(f"logs/{run_id}", exist_ok=True)
-            torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
         # the last step only has the validation loop, so break to avoid training
         break
 
@@ -754,7 +776,8 @@ for step in range(train_steps + 1):
     model.zero_grad(set_to_none=True)
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    if step % 100 == 0:
+        print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
